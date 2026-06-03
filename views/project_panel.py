@@ -1,3 +1,4 @@
+import copy
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QTreeWidget, QTreeWidgetItem, QMenu, QInputDialog, QMessageBox
 )
@@ -72,11 +73,13 @@ class ProjectPanel(QWidget):
         add_ana = menu.addAction("Add analysis sheet…")
         action_remove = None
         action_rename = None
+        action_duplicate = None
         if item is not None:
             kind, sheet = item.data(0, Qt.UserRole) or ("", None)
             if kind in ("calib", "ana"):
                 menu.addSeparator()
                 action_rename = menu.addAction("Rename…")
+                action_duplicate = menu.addAction("Duplicate")
                 action_remove = menu.addAction("Remove")
 
         action = menu.exec(self.tree.viewport().mapToGlobal(pos))
@@ -86,8 +89,41 @@ class ProjectPanel(QWidget):
             self.add_analysis_requested.emit()
         elif action == action_rename and item is not None:
             self._rename_sheet(item)
+        elif action == action_duplicate and item is not None:
+            self._duplicate_sheet(item)
         elif action == action_remove and item is not None:
             self._remove_sheet(item)
+
+    def _duplicate_sheet(self, item):
+        kind, sheet = item.data(0, Qt.UserRole)
+        dup = copy.deepcopy(sheet)
+        if kind == "calib":
+            dup.substrate = (dup.substrate + " copy").strip() if dup.substrate else "copy"
+            idx = self.project.calibration_sheets.index(sheet)
+            self.project.calibration_sheets.insert(idx + 1, dup)
+        elif kind == "ana":
+            dup.name = f"{dup.name} (copy)"
+            idx = self.project.analysis_sheets.index(sheet)
+            self.project.analysis_sheets.insert(idx + 1, dup)
+        self.refresh()
+        self.project_changed.emit()
+        self._select_sheet(dup)
+
+    def _select_sheet(self, sheet):
+        """Select the tree item whose UserRole sheet matches `sheet`."""
+        def walk(parent):
+            for i in range(parent.childCount()):
+                child = parent.child(i)
+                data = child.data(0, Qt.UserRole) or ("", None)
+                if data[1] is sheet:
+                    self.tree.setCurrentItem(child)
+                    return True
+                if walk(child):
+                    return True
+            return False
+        root = self.tree.topLevelItem(0)
+        if root is not None:
+            walk(root)
 
     def _rename_sheet(self, item):
         kind, sheet = item.data(0, Qt.UserRole)

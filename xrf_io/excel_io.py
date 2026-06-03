@@ -23,7 +23,7 @@ from openpyxl.utils import get_column_letter
 
 from models.project import (
     Project, CalibrationSheet, CalibrationSample, AnalysisSheet, AnalysisSample,
-    INPUT_MASS, INPUT_LOADING,
+    INPUT_MASS, INPUT_LOADING, CF_SOURCE_CALIBRATION,
 )
 
 
@@ -47,6 +47,16 @@ def save_project(project: Project, path: str) -> None:
     meta = wb.create_sheet("_xrf_meta")
     meta["A1"] = "project_name"; meta["B1"] = project.name
     meta["A2"] = "diameter_cm";  meta["B2"] = project.diameter_cm
+    row = 3
+    for ans in project.analysis_sheets:
+        for el, src in ans.element_cf_sources.items():
+            meta.cell(row=row, column=1, value=f"{ans.name}::{el}::cf_source")
+            meta.cell(row=row, column=2, value=str(src))
+            row += 1
+        for el, sc in ans.element_specific_capacities.items():
+            meta.cell(row=row, column=1, value=f"{ans.name}::{el}::spec_cap_exp")
+            meta.cell(row=row, column=2, value=float(sc))
+            row += 1
     meta.sheet_state = "hidden"
 
     for cs in project.calibration_sheets:
@@ -94,7 +104,7 @@ def _write_calibration_sheet(wb, cs: CalibrationSheet, project: Project) -> None
     unc_col_lbl  = "σ_loading (mg/cm²)"     if cs.input_mode == INPUT_LOADING else "σ_mass (mg)"
     headers = ["Sample ID", mass_col_lbl, "Mass Loading (mg/cm²)",
                "XRF Loading (mg/cm²)", "Corr. Factor",
-               "Corr. Loading (mg/cm²)", "% Error", unc_col_lbl]
+               "Corr. Loading (mg/cm²)", "% Error", unc_col_lbl, "Excluded"]
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=8, column=col, value=h)
         c.fill = _HDR_FILL; c.font = _HDR_FONT
@@ -116,6 +126,7 @@ def _write_calibration_sheet(wb, cs: CalibrationSheet, project: Project) -> None
             f"=D{row_i}*$B$5",
             f"=ABS(F{row_i}-C{row_i})/C{row_i}*100",
             s.mass_uncertainty,
+            1 if getattr(s, "is_excluded", False) else 0,
         ]
         for col_i, v in enumerate(col_vals, 1):
             c = ws.cell(row=row_i, column=col_i, value=v)
@@ -146,7 +157,8 @@ def _write_analysis_sheet(wb, ans: AnalysisSheet, project: Project) -> None:
     mass_col_lbl = "Mass Loading (mg/cm²)" if ans.input_mode == INPUT_LOADING else "Mass (mg)"
     fixed_pre  = ["Sample ID", mass_col_lbl, "Mass Loading (mg/cm²)"]
     xrf_hdrs   = [f"XRF {el} (mg/cm²)" for el in ans.elements]
-    fixed_post = ["XRF Total (mg/cm²)", "Corr. Total (mg/cm²)", "% Error", "σ_corr (mg/cm²)", "Notes"]
+    fixed_post = ["XRF Total (mg/cm²)", "Corr. Total (mg/cm²)", "% Error", "σ_corr (mg/cm²)",
+                  "Practical SC (mAh/g)", "Notes", "Excluded"]
     headers    = fixed_pre + xrf_hdrs + fixed_post
     hdr_row    = 8
 
@@ -201,7 +213,15 @@ def _write_analysis_sheet(wb, ans: AnalysisSheet, project: Project) -> None:
         c.border = _BORDER; c.number_format = "0.00"
 
         ws.cell(row=row_i, column=sig_col, value="").border = _BORDER
-        ws.cell(row=row_i, column=notes_col, value=s.notes).border = _BORDER
+        prac_sc_col  = notes_col
+        notes_col2   = prac_sc_col + 1
+        excl_col     = notes_col2 + 1
+        prac_sc = getattr(s, "practical_specific_capacity", float("nan"))
+        ws.cell(row=row_i, column=prac_sc_col,
+                value="" if math.isnan(prac_sc) else prac_sc).border = _BORDER
+        ws.cell(row=row_i, column=notes_col2, value=s.notes).border = _BORDER
+        ws.cell(row=row_i, column=excl_col,
+                value=1 if getattr(s, "is_excluded", False) else 0).border = _BORDER
 
     _autofit(ws)
 
@@ -223,14 +243,31 @@ def load_project(path: str) -> Project:
     wb = openpyxl.load_workbook(path, data_only=True)
 
     name, diameter_cm = "Imported Project", 1.27
+    element_cf_sources_map   = {}   # sheet_name → {element → source}
+    element_spec_cap_map     = {}   # sheet_name → {element → expected mAh/g}
     if "_xrf_meta" in wb.sheetnames:
         meta = wb["_xrf_meta"]
         for row in meta.iter_rows(values_only=True):
-            if row[0] == "project_name" and row[1]:
-                name = str(row[1])
-            if row[0] == "diameter_cm" and row[1]:
+            if not row or row[0] is None:
+                continue
+            key = str(row[0])
+            val = str(row[1]) if row[1] is not None else ""
+            if key == "project_name":
+                name = val
+            elif key == "diameter_cm":
                 try: diameter_cm = float(row[1])
                 except (ValueError, TypeError): pass
+            elif "::" in key:
+                parts = key.split("::")
+                if len(parts) == 3:
+                    sname, el, attr = parts
+                    if attr == "cf_source":
+                        element_cf_sources_map.setdefault(sname, {})[el] = val
+                    elif attr == "spec_cap_exp":
+                        try:
+                            element_spec_cap_map.setdefault(sname, {})[el] = float(row[1])
+                        except (ValueError, TypeError):
+                            pass
 
     project = Project(name=name, diameter_cm=diameter_cm)
 
@@ -267,8 +304,10 @@ def load_project(path: str) -> Project:
             result.input_mode  = input_mode
             project.calibration_sheets.append(result)
         elif isinstance(result, AnalysisSheet):
-            result.diameter_cm = diam_override
-            result.input_mode  = input_mode
+            result.diameter_cm                  = diam_override
+            result.input_mode                   = input_mode
+            result.element_cf_sources                      = element_cf_sources_map.get(sheet_name, {})
+            result.element_specific_capacities = element_spec_cap_map.get(sheet_name, {})
             project.analysis_sheets.append(result)
 
     return project
@@ -318,7 +357,8 @@ def _parse_native_calibration(rows, sheet_name):
                 mass_col = i; break
         if mass_col is None:
             return None
-        unc_col = next((i for i, h in enumerate(headers) if "σ" in h or "unc" in h), None)
+        unc_col  = next((i for i, h in enumerate(headers) if "σ" in h or "unc" in h), None)
+        excl_col = next((i for i, h in enumerate(headers) if "exclu" in h), None)
     except StopIteration:
         return None
 
@@ -331,11 +371,13 @@ def _parse_native_calibration(rows, sheet_name):
         if not row or row[id_col] is None and row[mass_col] is None:
             continue
         try:
+            excl = bool(int(row[excl_col] or 0)) if excl_col is not None and excl_col < len(row) and row[excl_col] is not None else False
             samples.append(CalibrationSample(
                 sample_id=str(row[id_col] or ""),
                 mass_mg=float(row[mass_col] or 0),
                 xrf_loading=float(row[xrf_col] or 0),
                 mass_uncertainty=float(row[unc_col] or 0.01) if unc_col is not None and row[unc_col] is not None else 0.01,
+                is_excluded=excl,
             ))
         except (ValueError, TypeError):
             continue
@@ -371,7 +413,9 @@ def _parse_native_analysis(rows, sheet_name):
         return None
 
     notes_col = next((i for i, h in enumerate(headers) if "note" in h), None)
-    elements = list(xrf_cols.keys())
+    prac_col  = next((i for i, h in enumerate(headers) if "practical" in h and "sc" in h), None)
+    excl_col  = next((i for i, h in enumerate(headers) if "exclu" in h), None)
+    elements  = list(xrf_cols.keys())
 
     samples = []
     for row in rows[hdr_i + 1:]:
@@ -380,11 +424,18 @@ def _parse_native_analysis(rows, sheet_name):
         try:
             loadings = {el: float(row[col] or 0) for el, col in xrf_cols.items()}
             notes = str(row[notes_col] or "") if notes_col is not None and row[notes_col] is not None else ""
+            prac_sc = float("nan")
+            if prac_col is not None and prac_col < len(row) and row[prac_col] is not None:
+                try: prac_sc = float(row[prac_col])
+                except (ValueError, TypeError): pass
+            excl = bool(int(row[excl_col] or 0)) if excl_col is not None and excl_col < len(row) and row[excl_col] is not None else False
             samples.append(AnalysisSample(
                 sample_id=str(row[id_col] or ""),
                 mass_mg=float(row[mass_col] or 0),
                 xrf_loadings=loadings,
                 notes=notes,
+                practical_specific_capacity=prac_sc,
+                is_excluded=excl,
             ))
         except (ValueError, TypeError):
             continue

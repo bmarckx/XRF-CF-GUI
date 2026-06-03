@@ -1,10 +1,11 @@
+import math
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QPushButton, QComboBox, QGroupBox, QFormLayout
 )
 from PySide6.QtCore import Qt
 
-from models.project import CalibrationSheet, AnalysisSheet
+from models.project import CalibrationSheet, AnalysisSheet, CF_SOURCE_CALIBRATION
 from models.calculations import (
     compute_calibration_sheet, compute_analysis_sheet,
     descriptive_stats, fit_correction_factors,
@@ -20,7 +21,6 @@ class StatisticsTab(QWidget):
 
         layout = QVBoxLayout(self)
 
-        # ── descriptive stats ──
         stat_grp = QGroupBox("Descriptive Statistics")
         stat_l   = QVBoxLayout(stat_grp)
         self.stat_table = QTableWidget()
@@ -29,14 +29,12 @@ class StatisticsTab(QWidget):
         stat_l.addWidget(self.stat_table)
         layout.addWidget(stat_grp)
 
-        # ── outliers ──
         out_grp = QGroupBox("Outliers (Grubbs test, α = 0.05)")
         out_l   = QVBoxLayout(out_grp)
         self.out_label = QLabel("—")
         out_l.addWidget(self.out_label)
         layout.addWidget(out_grp)
 
-        # ── uncertainty ──
         unc_grp = QGroupBox("Uncertainty Budget")
         unc_l   = QVBoxLayout(unc_grp)
         self.unc_label = QLabel("—")
@@ -44,7 +42,6 @@ class StatisticsTab(QWidget):
         unc_l.addWidget(self.unc_label)
         layout.addWidget(unc_grp)
 
-        # ── curve fit ──
         self.fit_grp = QGroupBox("Curve Fit")
         fit_l   = QVBoxLayout(self.fit_grp)
         ctrl    = QHBoxLayout()
@@ -73,7 +70,6 @@ class StatisticsTab(QWidget):
         return self._last_fit
 
     def refresh(self):
-        # Update fit-button state on every refresh, before any early returns
         has_sheet = self.project is not None and self.sheet is not None
         self.fit_btn.setEnabled(has_sheet)
         is_calib = isinstance(self.sheet, CalibrationSheet)
@@ -89,9 +85,9 @@ class StatisticsTab(QWidget):
 
         if is_calib:
             r = compute_calibration_sheet(self.sheet, self.project)
-            cfs   = [sr.corr_factor for sr in r.sample_results]
-            errs  = [sr.pct_error  for sr in r.sample_results]
-            mlds  = [sr.mass_loading for sr in r.sample_results]
+            cfs  = [sr.corr_factor   for sr in r.sample_results]
+            errs = [sr.pct_error     for sr in r.sample_results]
+            mlds = [sr.mass_loading  for sr in r.sample_results]
 
             self._populate_stat_table({
                 "Correction factor": descriptive_stats(cfs),
@@ -107,22 +103,47 @@ class StatisticsTab(QWidget):
 
             self.unc_label.setText(
                 f"CF = {r.correction_factor:.4f} ± {r.cf_uncertainty:.4f}  (1σ standard error)<br>"
-                f"σ<sub>CF</sub> (sample std) = {r.cf_std:.4f}  |  "
-                f"n = {len(cfs)}"
+                f"σ<sub>CF</sub> (sample std) = {r.cf_std:.4f}  |  n = {len(cfs)}"
             )
         else:
             calib_results = {cs.element: compute_calibration_sheet(cs, self.project)
                              for cs in self.project.calibration_sheets}
             r = compute_analysis_sheet(self.sheet, calib_results, self.project)
-            errs   = [sr.pct_error for sr in r.sample_results]
-            corrs  = [sr.corrected_total for sr in r.sample_results]
-            sigs   = [sr.sigma_corrected for sr in r.sample_results]
 
-            self._populate_stat_table({
-                "% Error":         descriptive_stats(errs),
-                "Corrected total": descriptive_stats(corrs),
-                "σ_corrected":     descriptive_stats(sigs),
-            })
+            errs      = [sr.pct_error        for sr in r.sample_results]
+            ref_errs  = [sr.ref_pct_error     for sr in r.sample_results]
+            corrs     = [sr.corrected_total   for sr in r.sample_results]
+            masses    = [sr.corrected_mass_total for sr in r.sample_results]
+            sigs      = [sr.sigma_corrected   for sr in r.sample_results]
+            self_cfs  = [sr.self_cf for sr in r.sample_results
+                         if not math.isnan(sr.self_cf)]
+
+            ecs = self.sheet.element_cf_sources
+            has_override = any(ecs.get(el, CF_SOURCE_CALIBRATION) != CF_SOURCE_CALIBRATION
+                               for el in self.sheet.elements)
+
+            stat_blocks = {
+                "% Error (active)":      descriptive_stats(errs),
+                "Corrected total load.": descriptive_stats(corrs),
+                "Corrected total mass":  descriptive_stats(masses),
+                "σ_corrected":           descriptive_stats(sigs),
+            }
+            if has_override:
+                stat_blocks["% Error (ref. calib)"] = descriptive_stats(ref_errs)
+            if self_cfs:
+                stat_blocks["Self CF (per sample)"] = descriptive_stats(self_cfs)
+
+            prac_scs = [getattr(self.sheet.samples[j], "practical_specific_capacity", float("nan"))
+                        for j in range(len(r.sample_results))]
+            prac_scs = [v for v in prac_scs if not math.isnan(v)]
+            cap_loadings = [sr.cap_regime_loading for sr in r.sample_results
+                            if not math.isnan(sr.cap_regime_loading)]
+            if prac_scs:
+                stat_blocks["Practical SC (mAh/g)"]       = descriptive_stats(prac_scs)
+            if cap_loadings:
+                stat_blocks["Cap.-regime loading (mg/cm²)"] = descriptive_stats(cap_loadings)
+
+            self._populate_stat_table(stat_blocks)
 
             if r.outlier_indices:
                 ids = [r.sample_results[i].sample_id for i in r.outlier_indices]
@@ -130,16 +151,35 @@ class StatisticsTab(QWidget):
             else:
                 self.out_label.setText("No outliers detected.")
 
-            cf_str = "<br>".join(
-                f"{el}: CF = {cr.correction_factor:.4f} ± {cr.cf_uncertainty:.4f}"
-                for el, cr in calib_results.items()
-                if el in self.sheet.elements
-            )
-            self.unc_label.setText(
-                cf_str + f"<br>Mean σ_corrected = {sum(sigs)/len(sigs):.4f} mg/cm² "
-                f"(propagated from CF uncertainty + 2% XRF reading uncertainty)"
-                if sigs else cf_str
-            )
+            # Uncertainty budget
+            unc_lines = []
+            for el in self.sheet.elements:
+                src = ecs.get(el, CF_SOURCE_CALIBRATION)
+                active_cf = r.correction_factors.get(el, float("nan"))
+                ref_cf    = r.ref_correction_factors.get(el, float("nan"))
+                cr = calib_results.get(el)
+                if src == CF_SOURCE_CALIBRATION and cr is not None:
+                    unc_lines.append(
+                        f"{el} [calib]: CF = {active_cf:.4f} ± {cr.cf_uncertainty:.4f}"
+                    )
+                elif src == "self":
+                    unc_lines.append(
+                        f"{el} [self]: CF = {active_cf:.4f}  "
+                        f"(self CF = {r.self_cf:.4f} ± {r.self_cf_uncertainty:.4f})"
+                    )
+                else:
+                    unc_lines.append(f"{el} [custom]: CF = {active_cf:.4f}  |  ref calib CF = {ref_cf:.4f}")
+            if not math.isnan(r.self_cf):
+                unc_lines.append(
+                    f"<br>Sheet self CF = {r.self_cf:.4f} ± {r.self_cf_uncertainty:.4f}  "
+                    f"(σ = {r.self_cf_std:.4f})"
+                )
+            if sigs:
+                unc_lines.append(
+                    f"Mean σ_corrected = {sum(sigs)/len(sigs):.4f} mg/cm²  "
+                    f"(CF uncertainty + 2% XRF reading)"
+                )
+            self.unc_label.setText("<br>".join(unc_lines))
 
     def _populate_stat_table(self, blocks: dict):
         cols = ["Metric", "n", "Mean", "Std", "Min", "Max", "Median", "CV%"]

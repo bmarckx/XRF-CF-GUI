@@ -7,6 +7,11 @@ from typing import Optional
 INPUT_MASS    = "mass"        # mass_mg stores mg; loading = mg / area
 INPUT_LOADING = "loading"     # mass_mg stores mg/cm² directly
 
+# element_cf_sources values (per-element CF source in AnalysisSheet)
+CF_SOURCE_CALIBRATION = "calibration"   # use the element's CalibrationSheet CF
+CF_SOURCE_SELF        = "self"          # use the sheet's own self-derived CF (mean mass_loading/xrf_total)
+# Any other value is interpreted as a float (manual override)
+
 
 @dataclass
 class CalibrationSample:
@@ -14,6 +19,7 @@ class CalibrationSample:
     mass_mg: float              # raw input: mg if mode='mass', mg/cm² if mode='loading'
     xrf_loading: float          # mg/cm²
     mass_uncertainty: float = 0.01
+    is_excluded: bool = False   # manually excluded from CF calculation
 
 
 @dataclass
@@ -43,6 +49,8 @@ class AnalysisSample:
     mass_mg: float
     xrf_loadings: dict = field(default_factory=dict)
     notes: str = ""
+    practical_specific_capacity: float = float("nan")  # measured practical SC per sample, mAh/g
+    is_excluded: bool = False                          # manually excluded from calculations
 
 
 @dataclass
@@ -52,6 +60,11 @@ class AnalysisSheet:
     samples: list = field(default_factory=list)
     diameter_cm: Optional[float] = None
     input_mode: str = INPUT_MASS
+    # Per-element CF source: maps element → "calibration" | "self" | str(float)
+    # Missing keys default to "calibration"
+    element_cf_sources: dict = field(default_factory=dict)
+    # Per-element expected (theoretical) specific capacities (mAh/g); absent key = inactive
+    element_specific_capacities: dict = field(default_factory=dict)
 
     def effective_diameter(self, project) -> float:
         return self.diameter_cm if self.diameter_cm is not None else project.diameter_cm

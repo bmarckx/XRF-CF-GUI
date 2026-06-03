@@ -70,6 +70,7 @@ class MainWindow(QMainWindow):
         self.viz_tab     = VisualizationTab()
 
         self.data_tab.data_changed.connect(self._on_data_changed)
+        self.data_tab.samples_moved.connect(self.panel.refresh)
 
         self.tabs.addTab(self.data_tab,    "Data")
         self.tabs.addTab(self.results_tab, "Results")
@@ -177,7 +178,8 @@ class MainWindow(QMainWindow):
         self._refresh_views(None)
 
     def _on_data_changed(self):
-        # Data edited → refresh results/stats/viz for current sheet
+        # Data edited → refresh all tabs including the CF panel in data_tab
+        self.data_tab._rebuild_cf_panel()
         self.results_tab.refresh()
         self.stats_tab.refresh()
         self.viz_tab.refresh()
