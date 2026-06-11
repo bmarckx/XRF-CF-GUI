@@ -54,13 +54,15 @@ class AnalysisSampleResult:
     # ── Per-sample self CF (informational, always computed) ──
     self_cf: float = float("nan")     # mass_loading / xrf_total for this sample
 
-    # Capacity-based mass loading regime (element-specific):
-    #   active elements:    xrf_el × (mean_practical_sc / expected_sc_el)
-    #   non-active elements: xrf_el × residual capacity CF (same logic as residual self CF)
-    cap_regime_loading: float = float("nan")              # mg/cm² (total)
-    cap_regime_mass: float = float("nan")                 # mg (total)
-    cap_regime_per_element: Optional[dict] = None         # element → mg/cm²
-    cap_regime_mass_per_element: Optional[dict] = None    # element → mg
+    # Capacity-based mass loading regime:
+    #   total = Σ(inactive loadings, unscaled, frozen from chosen regime)
+    #         + Σ(active basis_el × mean_practical_sc / expected_sc_el)
+    cap_regime_loading: float = float("nan")              # mg/cm² (grand total: inactive + active adj)
+    cap_regime_mass: float = float("nan")                 # mg (grand total)
+    cap_regime_per_element: Optional[dict] = None         # active element → adjusted mg/cm²
+    cap_regime_mass_per_element: Optional[dict] = None    # active element → adjusted mg
+    cap_mass_utilized: float = float("nan")               # active-only pre-scale sum, mg/cm²
+    cap_inactive_loading: float = float("nan")            # inactive total (unscaled), mg/cm²
 
     is_outlier: bool = False
 
@@ -289,60 +291,72 @@ def compute_analysis_sheet(sheet, calib_results: dict, project, alpha: float = 0
     mean_psc = float(np.mean(psc_vals))        if psc_vals        else float("nan")
     psc_std  = float(np.std(psc_vals, ddof=1)) if len(psc_vals)>1 else 0.0
 
-    # ── Capacity-based mass-loading regime (element-specific) ──
-    # Active elements (expected SC defined): cap CF = mean_practical_sc / expected_sc_el.
-    # Non-active elements: residual capacity CF, computed like the residual self CF
-    #   residual_i = mass_loading_i - Σ(active xrf_el × cap_cf_el),  CF = residual / xrf_nonactive.
+    # ── Capacity-based mass-loading regime ──
+    # Per sample, per-element loadings come from a chosen regime (frozen snapshot, or live).
+    # The inactive (collector) loadings are added UNSCALED; each active element is scaled by
+    # its utilization (mean practical SC / expected SC).  Total = inactive + adjusted active.
+    # "Mass utilized" is the active-only pre-scale sum.
     esc = getattr(sheet, "element_specific_capacities", {})
     cap_active_els = [el for el in sheet.elements
                       if el in esc and not math.isnan(esc.get(el, float("nan"))) and esc.get(el, 0) > 0]
-    cap_nonactive_els = [el for el in sheet.elements if el not in cap_active_els]
 
-    cap_cf, cap_residual_cf = {}, float("nan")
+    cap_cf = {}
     if cap_active_els and not math.isnan(mean_psc) and mean_psc > 0:
         for el in cap_active_els:
             cap_cf[el] = mean_psc / esc[el]
 
-        if cap_nonactive_els:
-            residual_cfs = []
-            for j, s in enumerate(sheet.samples):
-                if j in outlier_idx or j >= len(sample_results):
-                    continue
-                ml_j  = sample_results[j].mass_loading
-                known = sum(s.xrf_loadings.get(el, 0.0) * cap_cf[el] for el in cap_active_els)
-                xrf_non = sum(s.xrf_loadings.get(el, 0.0) for el in cap_nonactive_els)
-                if xrf_non > 0:
-                    residual_cfs.append((ml_j - known) / xrf_non)
-            cap_residual_cf = float(np.mean(residual_cfs)) if residual_cfs else float("nan")
-            for el in cap_nonactive_els:
-                cap_cf[el] = cap_residual_cf
+    def _basis_loadings(s, sr):
+        """Per-element basis loadings: the frozen snapshot if present, else live from cap_mass_basis."""
+        frozen = getattr(s, "cap_frozen_loadings", None) or {}
+        if frozen:
+            return {el: float(frozen.get(el, 0.0)) for el in sheet.elements}
+        basis = getattr(s, "cap_mass_basis", "measured")
+        out = {}
+        for el in sheet.elements:
+            xrf_el = s.xrf_loadings.get(el, 0.0)
+            if   basis == "calibration":
+                out[el] = xrf_el * _safe_cf(ref_cfs.get(el))
+            elif basis == "self":
+                out[el] = xrf_el * (mean_self_cf if not math.isnan(mean_self_cf) else 1.0)
+            elif basis == "active":
+                out[el] = sr.corrected_per_element.get(el, 0.0)
+            else:  # "measured": split whole-electrode measured loading by XRF proportion
+                out[el] = sr.mass_loading * (xrf_el / sr.xrf_total) if sr.xrf_total > 0 else 0.0
+        return out
 
+    if cap_active_els and cap_cf:
         for j, sr in enumerate(sample_results):
             s = sheet.samples[j]
-            cap_per_el, cap_mass_per_el, cap_load = {}, {}, 0.0
-            for el in sheet.elements:
-                cf = cap_cf.get(el, float("nan"))
-                contrib = s.xrf_loadings.get(el, 0.0) * (cf if not math.isnan(cf) else 0.0)
-                cap_per_el[el]      = contrib
-                cap_mass_per_el[el] = contrib * area
-                cap_load += contrib
-            sr.cap_regime_per_element      = cap_per_el
+            basis = _basis_loadings(s, sr)
+            inactive_total = sum(basis.get(el, 0.0) for el in sheet.elements if el not in cap_active_els)
+            mass_util      = sum(basis.get(el, 0.0) for el in cap_active_els)   # active pre-scale
+            cap_per_el, cap_mass_per_el, active_adj = {}, {}, 0.0
+            for el in cap_active_els:
+                adj = basis.get(el, 0.0) * cap_cf[el]      # scale active by utilization
+                cap_per_el[el]      = adj
+                cap_mass_per_el[el] = adj * area
+                active_adj += adj
+            total = inactive_total + active_adj
+            sr.cap_regime_per_element      = cap_per_el       # active elements only
             sr.cap_regime_mass_per_element = cap_mass_per_el
-            sr.cap_regime_loading          = cap_load
-            sr.cap_regime_mass             = cap_load * area
+            sr.cap_regime_loading          = total            # inactive (unscaled) + active (adjusted)
+            sr.cap_regime_mass             = total * area
+            sr.cap_mass_utilized           = mass_util
+            sr.cap_inactive_loading        = inactive_total
     else:
         for sr in sample_results:
-            sr.cap_regime_loading = float("nan")
-            sr.cap_regime_mass    = float("nan")
+            sr.cap_regime_per_element      = {}
+            sr.cap_regime_mass_per_element = {}
+            sr.cap_regime_loading          = float("nan")
+            sr.cap_regime_mass             = float("nan")
+            sr.cap_mass_utilized           = float("nan")
+            sr.cap_inactive_loading        = float("nan")
+    cap_residual_cf = float("nan")
 
-    # cap regime mean error (non-outlier samples)
-    cap_errs = []
-    for j, sr in enumerate(sample_results):
-        if j in outlier_idx or math.isnan(sr.cap_regime_loading):
-            continue
-        ml_j = sr.mass_loading
-        if ml_j > 0:
-            cap_errs.append(abs(sr.cap_regime_loading - ml_j) / ml_j * 100)
+    # Cap regime total is a whole-electrode loading → compare to measured.
+    cap_errs = [abs(sr.cap_regime_loading - sr.mass_loading) / sr.mass_loading * 100
+                for j, sr in enumerate(sample_results)
+                if j not in outlier_idx and sr.mass_loading > 0 and not math.isnan(sr.cap_regime_loading)]
     cap_mean_err = float(np.mean(cap_errs)) if cap_errs else float("nan")
 
     return AnalysisSheetResult(
@@ -416,7 +430,8 @@ def compute_all_regimes(sheet, calib_results: dict, project) -> list:
         "samples":     _apply_cfs(self_cfs),
     })
 
-    # Capacity regime: element-specific (active = mean_psc / expected_sc, non-active = residual CF)
+    # Capacity regime (active-element mass only). Included so the regime-comparison
+    # plot can show it, even though it is not surfaced in the results table.
     if not math.isnan(r_active.mean_practical_sc) and r_active.cap_correction_factors:
         cap_rows = []
         for j, sr in enumerate(r_active.sample_results):
@@ -426,7 +441,7 @@ def compute_all_regimes(sheet, calib_results: dict, project) -> list:
             cap_rows.append({"sample_id": sr.sample_id, "corrected_total": cap_load,
                              "corrected_mass": sr.cap_regime_mass, "pct_error": err})
         regimes.append({
-            "name":        f"Capacity  (mean prac. SC = {r_active.mean_practical_sc:.1f} mAh/g)",
+            "name":        f"Capacity (active, mean prac. SC = {r_active.mean_practical_sc:.1f} mAh/g)",
             "element_cfs": dict(r_active.cap_correction_factors),
             "samples":     cap_rows,
         })

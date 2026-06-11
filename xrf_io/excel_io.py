@@ -158,7 +158,8 @@ def _write_analysis_sheet(wb, ans: AnalysisSheet, project: Project) -> None:
     fixed_pre  = ["Sample ID", mass_col_lbl, "Mass Loading (mg/cm²)"]
     xrf_hdrs   = [f"XRF {el} (mg/cm²)" for el in ans.elements]
     fixed_post = ["XRF Total (mg/cm²)", "Corr. Total (mg/cm²)", "% Error", "σ_corr (mg/cm²)",
-                  "Practical SC (mAh/g)", "Notes", "Excluded"]
+                  "Practical SC (mAh/g)", "Cap Basis", "Mass Utilized (mg/cm²)",
+                  "Cap Frozen Loadings", "Notes", "Excluded"]
     headers    = fixed_pre + xrf_hdrs + fixed_post
     hdr_row    = 8
 
@@ -213,12 +214,25 @@ def _write_analysis_sheet(wb, ans: AnalysisSheet, project: Project) -> None:
         c.border = _BORDER; c.number_format = "0.00"
 
         ws.cell(row=row_i, column=sig_col, value="").border = _BORDER
-        prac_sc_col  = notes_col
-        notes_col2   = prac_sc_col + 1
-        excl_col     = notes_col2 + 1
+        prac_sc_col   = notes_col
+        cap_basis_col = prac_sc_col + 1
+        mass_util_col = cap_basis_col + 1
+        frozen_col    = mass_util_col + 1
+        notes_col2    = frozen_col + 1
+        excl_col      = notes_col2 + 1
         prac_sc = getattr(s, "practical_specific_capacity", float("nan"))
         ws.cell(row=row_i, column=prac_sc_col,
                 value="" if math.isnan(prac_sc) else prac_sc).border = _BORDER
+        ws.cell(row=row_i, column=cap_basis_col,
+                value=getattr(s, "cap_mass_basis", "measured")).border = _BORDER
+        # Mass utilized = active-only pre-scale sum (informational; recomputed on load)
+        frozen = getattr(s, "cap_frozen_loadings", None) or {}
+        active_els = [el for el in ans.elements if el in ans.element_specific_capacities]
+        mu = sum(float(frozen.get(el, 0.0)) for el in active_els)
+        ws.cell(row=row_i, column=mass_util_col,
+                value="" if not mu else mu).border = _BORDER
+        frozen_str = ";".join(f"{el}={frozen[el]}" for el in frozen) if frozen else ""
+        ws.cell(row=row_i, column=frozen_col, value=frozen_str).border = _BORDER
         ws.cell(row=row_i, column=notes_col2, value=s.notes).border = _BORDER
         ws.cell(row=row_i, column=excl_col,
                 value=1 if getattr(s, "is_excluded", False) else 0).border = _BORDER
@@ -415,7 +429,9 @@ def _parse_native_analysis(rows, sheet_name):
     notes_col = next((i for i, h in enumerate(headers) if "note" in h), None)
     prac_col  = next((i for i, h in enumerate(headers) if "practical" in h and "sc" in h), None)
     excl_col  = next((i for i, h in enumerate(headers) if "exclu" in h), None)
-    elements  = list(xrf_cols.keys())
+    basis_col  = next((i for i, h in enumerate(headers) if "cap basis" in h or "basis" in h), None)
+    frozen_col = next((i for i, h in enumerate(headers) if "frozen" in h), None)
+    elements   = list(xrf_cols.keys())
 
     samples = []
     for row in rows[hdr_i + 1:]:
@@ -429,6 +445,16 @@ def _parse_native_analysis(rows, sheet_name):
                 try: prac_sc = float(row[prac_col])
                 except (ValueError, TypeError): pass
             excl = bool(int(row[excl_col] or 0)) if excl_col is not None and excl_col < len(row) and row[excl_col] is not None else False
+            cap_basis = "measured"
+            if basis_col is not None and basis_col < len(row) and row[basis_col]:
+                cap_basis = str(row[basis_col]).strip().lower()
+            frozen = {}
+            if frozen_col is not None and frozen_col < len(row) and row[frozen_col]:
+                for pair in str(row[frozen_col]).split(";"):
+                    if "=" in pair:
+                        el, val = pair.split("=", 1)
+                        try: frozen[el.strip()] = float(val)
+                        except (ValueError, TypeError): pass
             samples.append(AnalysisSample(
                 sample_id=str(row[id_col] or ""),
                 mass_mg=float(row[mass_col] or 0),
@@ -436,6 +462,8 @@ def _parse_native_analysis(rows, sheet_name):
                 notes=notes,
                 practical_specific_capacity=prac_sc,
                 is_excluded=excl,
+                cap_mass_basis=cap_basis,
+                cap_frozen_loadings=frozen,
             ))
         except (ValueError, TypeError):
             continue

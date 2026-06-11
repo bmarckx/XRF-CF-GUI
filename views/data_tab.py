@@ -347,6 +347,8 @@ class DataTab(QWidget):
         else:
             exp_sp.setEnabled(False)
             self.sheet.element_specific_capacities.pop(el, None)
+        # Active set changed → the "Mass utilized" column depends on it; repopulate.
+        self._populate()
         self.data_changed.emit()
 
     def _on_cap_sc_changed(self, value):
@@ -402,7 +404,8 @@ class DataTab(QWidget):
             n_el = len(self.sheet.elements)
             cols = (["Sample ID", mass_lbl]
                     + [f"XRF {el} (mg/cm²)" for el in self.sheet.elements]
-                    + ["Practical SC (mAh/g)", "Notes", "Excl."])
+                    + ["Practical SC (mAh/g)", "Cap basis", "Mass utilized (mg/cm²)",
+                       "Notes", "Excl."])
             self.table.setColumnCount(len(cols))
             self.table.setHorizontalHeaderLabels(cols)
             self.table.setRowCount(len(self.sheet.samples))
@@ -413,8 +416,11 @@ class DataTab(QWidget):
                     self._set_cell(r, 2 + ei, s.xrf_loadings.get(el, ""))
                 prac = getattr(s, "practical_specific_capacity", float("nan"))
                 self._set_cell(r, 2 + n_el, "" if math.isnan(prac) else prac)
-                self._set_cell(r, 3 + n_el, s.notes)
-                self._set_excl_cell(r, 4 + n_el, getattr(s, "is_excluded", False))
+                self._set_basis_combo(r, 3 + n_el, getattr(s, "cap_mass_basis", "measured"))
+                mu = self._active_utilized(s)
+                self._set_cell(r, 4 + n_el, "" if not mu else round(mu, 6))
+                self._set_cell(r, 5 + n_el, s.notes)
+                self._set_excl_cell(r, 6 + n_el, getattr(s, "is_excluded", False))
 
         self._suppress_signal = False
 
@@ -427,6 +433,93 @@ class DataTab(QWidget):
         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
         item.setCheckState(Qt.Checked if excluded else Qt.Unchecked)
         self.table.setItem(row, col, item)
+
+    def _set_basis_combo(self, row, col, current):
+        combo = QComboBox()
+        combo.addItems(["measured", "calibration", "self", "active", "custom"])
+        idx = combo.findText(current if current in
+                             ("measured", "calibration", "self", "active", "custom") else "measured")
+        combo.setCurrentIndex(max(0, idx))
+        combo.setProperty("row", row)
+        combo.currentTextChanged.connect(self._on_cap_basis_changed)
+        self.table.setCellWidget(row, col, combo)
+
+    def _basis_loadings_for(self, basis):
+        """Per-sample, per-element loadings for the given basis regime (for snapshotting)."""
+        try:
+            calib = {cs.element: compute_calibration_sheet(cs, self.project)
+                     for cs in self.project.calibration_sheets}
+            r = compute_analysis_sheet(self.sheet, calib, self.project)
+        except Exception:
+            return None
+        rows = []
+        for j, sr in enumerate(r.sample_results):
+            s = self.sheet.samples[j]
+            per_el = {}
+            for el in self.sheet.elements:
+                xrf_el = s.xrf_loadings.get(el, 0.0)
+                if   basis == "calibration":
+                    cf = r.ref_correction_factors.get(el, 1.0)
+                    per_el[el] = xrf_el * (cf if not math.isnan(cf) else 1.0)
+                elif basis == "self":
+                    per_el[el] = xrf_el * (r.self_cf if not math.isnan(r.self_cf) else 1.0)
+                elif basis == "active":
+                    per_el[el] = (sr.corrected_per_element or {}).get(el, 0.0)
+                else:  # measured: split whole-electrode measured by XRF proportion
+                    per_el[el] = sr.mass_loading * (xrf_el / sr.xrf_total) if sr.xrf_total > 0 else 0.0
+            rows.append(per_el)
+        return rows
+
+    def _on_cap_basis_changed(self, basis):
+        if self._suppress_signal or not isinstance(self.sheet, AnalysisSheet):
+            return
+        combo = self.sender()
+        row = combo.property("row")
+        if row is None or row >= len(self.sheet.samples):
+            return
+        s = self.sheet.samples[row]
+        s.cap_mass_basis = basis
+        if basis != "custom":
+            snaps = self._basis_loadings_for(basis)
+            if snaps and row < len(snaps):
+                s.cap_frozen_loadings = dict(snaps[row])    # freeze per-element loadings
+        self._populate()
+        self.data_changed.emit()
+
+    def _active_utilized(self, s):
+        """Active-only pre-scale sum from a sample's frozen loadings (the 'mass utilized')."""
+        frozen = getattr(s, "cap_frozen_loadings", None) or {}
+        esc = self.sheet.element_specific_capacities
+        active = [el for el in self.sheet.elements if el in esc]
+        return sum(float(frozen.get(el, 0.0)) for el in active)
+
+    def _set_active_utilized(self, s, target):
+        """Set the active 'mass utilized' total by scaling the active frozen loadings to match.
+
+        Inactive frozen loadings are left untouched. Sets basis to 'custom'.
+        """
+        row = self.sheet.samples.index(s)
+        frozen = dict(getattr(s, "cap_frozen_loadings", None) or {})
+        if not frozen:
+            snaps = self._basis_loadings_for(getattr(s, "cap_mass_basis", "measured"))
+            if snaps and row < len(snaps):
+                frozen = dict(snaps[row])
+        esc = self.sheet.element_specific_capacities
+        active = [el for el in self.sheet.elements if el in esc]
+        cur = sum(float(frozen.get(el, 0.0)) for el in active)
+        if math.isnan(target):
+            # clear → revert to live basis
+            s.cap_frozen_loadings = {}
+            return
+        if cur > 0:
+            scale = target / cur
+            for el in active:
+                frozen[el] = float(frozen.get(el, 0.0)) * scale
+        elif active:
+            for el in active:
+                frozen[el] = target / len(active)
+        s.cap_frozen_loadings = frozen
+        s.cap_mass_basis = "custom"
 
     def _add_row(self):
         if self.sheet is None:
@@ -525,7 +618,7 @@ class DataTab(QWidget):
             s.is_excluded = (item.checkState() == Qt.Checked)
             self.data_changed.emit()
             return
-        if isinstance(self.sheet, AnalysisSheet) and c == 4 + len(self.sheet.elements):
+        if isinstance(self.sheet, AnalysisSheet) and c == 6 + len(self.sheet.elements):
             s.is_excluded = (item.checkState() == Qt.Checked)
             self.data_changed.emit()
             return
@@ -544,7 +637,9 @@ class DataTab(QWidget):
                     s.xrf_loadings[self.sheet.elements[c - 2]] = float(text) if text else 0.0
                 elif c == 2 + n_el:
                     s.practical_specific_capacity = float(text) if text else float("nan")
-                elif c == 3 + n_el:
+                elif c == 4 + n_el:                       # edit "Mass utilized" (active) → custom
+                    self._set_active_utilized(s, float(text) if text else float("nan"))
+                elif c == 5 + n_el:
                     s.notes = text
         except ValueError:
             QMessageBox.warning(self, "Invalid input", f"Could not parse '{text}' as a number.")

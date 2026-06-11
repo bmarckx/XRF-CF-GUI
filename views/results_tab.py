@@ -116,8 +116,7 @@ class ResultsTab(QWidget):
                         f"{_fmt(r.practical_sc_std, 2)} mAh/g")
         if r.cap_correction_factors:
             cap_cf_str = "  ".join(f"{el}={_fmt(cf)}" for el, cf in r.cap_correction_factors.items())
-            summary += (f"  |  Cap. CFs: {cap_cf_str}"
-                        f"  (cap mean error = {_fmt(r.cap_mean_pct_error, 2)}%)")
+            summary += f"  |  Cap. utilization (active): {cap_cf_str}"
         summary += (f"  |  self CF = {_fmt(r.self_cf)}  |  "
                     f"area = {_fmt(r.area_cm2)} cm²  |  outliers: {len(r.outlier_indices)}")
         self.summary_label.setText(summary)
@@ -136,15 +135,14 @@ class ResultsTab(QWidget):
             cols += ["Ref. Total\n(mg/cm²)", "Ref. Total\n(mg)", "Ref. % Error"]
         cols += ["% Error", "σ_corr\n(mg/cm²)"]
 
-        # Capacity-regime columns (shown when practical SC data and a capacity CF exist)
-        has_cap_regime = (any(not math.isnan(getattr(s, "practical_specific_capacity", float("nan")))
-                              for s in self.sheet.samples)
-                          and bool(r.cap_correction_factors))
+        # Capacity-regime columns — active elements only, plus the active-element total.
+        cap_active_els = list((r.cap_correction_factors or {}).keys())
+        has_cap_regime = bool(cap_active_els)
         if has_cap_regime:
-            cols += ["Prac. SC\n(mAh/g)"]
-            for el in self.sheet.elements:
+            cols += ["Prac. SC\n(mAh/g)", "Mass utilized\n(active, mg/cm²)"]
+            for el in cap_active_els:
                 cols.append(f"Cap. {el}\n(mg/cm²)")
-            cols += ["Cap.-regime\nloading (mg/cm²)", "Cap.-regime\nmass (mg)", "Cap. % Error"]
+            cols += ["Cap. total\n(mg/cm²)", "Cap. total\n(mg)"]
 
         self.table.setColumnCount(len(cols))
         self.table.setHorizontalHeaderLabels(cols)
@@ -171,15 +169,12 @@ class ResultsTab(QWidget):
             if has_cap_regime:
                 psc = getattr(self.sheet.samples[i], "practical_specific_capacity", float("nan"))
                 self._set(i, col, _fmt(psc, 2));                           col += 1
+                self._set(i, col, _fmt(sr.cap_mass_utilized));             col += 1
                 cpe = sr.cap_regime_per_element or {}
-                for el in self.sheet.elements:
+                for el in cap_active_els:
                     self._set(i, col, _fmt(cpe.get(el, float("nan"))));    col += 1
                 self._set(i, col, _fmt(sr.cap_regime_loading));            col += 1
                 self._set(i, col, _fmt(sr.cap_regime_mass));               col += 1
-                ml_i = sr.mass_loading
-                cap_err = (abs(sr.cap_regime_loading - ml_i) / ml_i * 100
-                           if ml_i > 0 and not math.isnan(sr.cap_regime_loading) else float("nan"))
-                self._set(i, col, _fmt(cap_err, 2));                       col += 1
             if sr.is_outlier:
                 self._highlight_row(i)
 

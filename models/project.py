@@ -12,6 +12,15 @@ CF_SOURCE_CALIBRATION = "calibration"   # use the element's CalibrationSheet CF
 CF_SOURCE_SELF        = "self"          # use the sheet's own self-derived CF (mean mass_loading/xrf_total)
 # Any other value is interpreted as a float (manual override)
 
+# Capacity-regime "mass utilized" basis options (per AnalysisSample.cap_mass_basis)
+CAP_BASIS_MEASURED    = "measured"
+CAP_BASIS_CALIBRATION = "calibration"
+CAP_BASIS_SELF        = "self"
+CAP_BASIS_ACTIVE      = "active"
+CAP_BASIS_CUSTOM      = "custom"
+CAP_BASES = [CAP_BASIS_MEASURED, CAP_BASIS_CALIBRATION, CAP_BASIS_SELF,
+             CAP_BASIS_ACTIVE, CAP_BASIS_CUSTOM]
+
 
 @dataclass
 class CalibrationSample:
@@ -51,6 +60,16 @@ class AnalysisSample:
     notes: str = ""
     practical_specific_capacity: float = float("nan")  # measured practical SC per sample, mAh/g
     is_excluded: bool = False                          # manually excluded from calculations
+    # Capacity regime basis:
+    #   cap_mass_basis : which regime the loadings were snapshotted from
+    #                    ("measured"|"calibration"|"self"|"active"|"custom")
+    #   cap_frozen_loadings : frozen per-element loadings (mg/cm²) captured from that regime.
+    #     Empty dict ⇒ compute the basis live from cap_mass_basis (not yet snapshotted).
+    #     The capacity regime adds the inactive loadings unscaled and scales the active
+    #     loadings by (mean practical SC / expected SC per element); "mass utilized" is the
+    #     active-only pre-scale sum.
+    cap_mass_basis: str = "measured"
+    cap_frozen_loadings: dict = field(default_factory=dict)
 
 
 @dataclass

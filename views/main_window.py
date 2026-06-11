@@ -1,3 +1,4 @@
+import os
 from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QTabWidget, QFileDialog, QMessageBox, QToolBar, QWidget
 )
@@ -5,6 +6,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
 
 from models.project import Project
+from models import settings
 from views.project_panel import ProjectPanel
 from views.data_tab import DataTab
 from views.results_tab import ResultsTab
@@ -91,8 +93,17 @@ class MainWindow(QMainWindow):
             self._refresh_views(None)
             self._update_title()
 
+    def _start_dir(self, filename=""):
+        """Default directory for file dialogs, optionally joined with a filename."""
+        base = settings.get_default_dir()
+        return os.path.join(base, filename) if filename else base
+
+    def _remember_dir(self, path):
+        settings.set_default_dir(os.path.dirname(os.path.abspath(path)))
+
     def action_open(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Excel project", "", "Excel (*.xlsx)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Excel project", self._start_dir(), "Excel (*.xlsx)")
         if not path:
             return
         try:
@@ -101,6 +112,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open failed", f"Could not load file:\n{e}")
             return
         self.current_path = path
+        self._remember_dir(path)
         self.panel.set_project(self.project)
         self._refresh_views(None)
         self._update_title()
@@ -122,13 +134,14 @@ class MainWindow(QMainWindow):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Excel project",
-            f"{self.project.name}.xlsx", "Excel (*.xlsx)"
+            self._start_dir(f"{self.project.name}.xlsx"), "Excel (*.xlsx)"
         )
         if not path:
             return
         try:
             save_project(self.project, path)
             self.current_path = path
+            self._remember_dir(path)
             self._update_title()
             self.statusBar().showMessage(f"Saved to {path}", 4000)
         except Exception as e:
@@ -160,10 +173,12 @@ class MainWindow(QMainWindow):
         if self.project is None:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export PDF report", f"{self.project.name}_report.pdf", "PDF (*.pdf)"
+            self, "Export PDF report",
+            self._start_dir(f"{self.project.name}_report.pdf"), "PDF (*.pdf)"
         )
         if not path:
             return
+        self._remember_dir(path)
         try:
             export_pdf(self.project, path)
             self.statusBar().showMessage(f"Exported {path}", 4000)

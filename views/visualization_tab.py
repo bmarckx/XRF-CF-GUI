@@ -238,6 +238,11 @@ class VisualizationTab(QWidget):
         self.canvas.draw()
 
     def _save_figure(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save figure", "", "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
+        from models import settings
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save figure", settings.get_default_dir(),
+            "PNG (*.png);;PDF (*.pdf);;SVG (*.svg)")
         if path:
             self.fig.savefig(path, dpi=200, bbox_inches="tight")
+            import os
+            settings.set_default_dir(os.path.dirname(os.path.abspath(path)))
